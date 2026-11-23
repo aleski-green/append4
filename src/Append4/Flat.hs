@@ -21,10 +21,13 @@ import Data.Text (Text)
 import qualified Data.Text.Encoding as TE
 import qualified Data.Vector as V
 import Data.Word
+import GHC.Generics (Generic)
 
 data Segment = Field Text | Index Word64 deriving (Eq,Ord,Show)
 data Atom = NullAtom | BoolAtom Bool | TextAtom Text | NumberAtom Integer Int
-          | ObjectAtom | ArrayAtom Word64 deriving (Eq,Show)
+          | ObjectAtom | ArrayAtom Word64 deriving (Eq,Show,Generic)
+instance ToJSON Atom
+instance FromJSON Atom
 data DB = Legacy L.DB | Flat L.DB L.DB L.DB
 
 putText :: Text -> Put

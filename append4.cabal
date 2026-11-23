@@ -6,8 +6,8 @@ license: LicenseRef-Sustainable-Use-1.0
 license-file: LICENSE.md
 extra-source-files: cbits/lmdb/README.md, cbits/lmdb/LICENSE, cbits/lmdb/COPYRIGHT, cbits/lmdb/CHANGES
 library
-  exposed-modules: Append4, Append4.Flat
-  other-modules: Append4.LMDB
+  exposed-modules: Append4, Append4.Flat, Append4.KV, Append4.Key, Append4.Convert
+  other-modules: Append4.LMDB, Append4.ScalarDB
   hs-source-dirs: src
   c-sources: cbits/lmdb/mdb.c, cbits/lmdb/midl.c
   include-dirs: cbits/lmdb

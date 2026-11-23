@@ -78,9 +78,9 @@ The fixture's load mode reports elapsed time for 200 concurrent durable writes.
 Target: at most 2,000 first-party Haskell lines and 250 Lean lines. Vendored LMDB
 remains upstream C code, not a second custom storage implementation.
 
-## Flat typed format (append4-flat-2)
+## Frozen migration format (append4-flat-2)
 
-New stores contain no serialized JSON. Each namespace has three B-trees:
+The frozen `Append4` API reads/writes v2 migration inputs. Each namespace has three B-trees:
 `state` maps logical keys to binary root atoms; `state.cells` maps physical field
 IDs to binary atoms; `state.paths` maps those IDs to versioned binary paths. The
 same layout is used for receipts, expiry, audit and metadata (15 B-trees total).
@@ -100,3 +100,22 @@ namespaces, including every historical transaction and duplicate ID, then reads
 back every converted value. It never publishes or deletes the source. The app
 owns version checks, source exclusion, backup, publication and restart recovery.
 The minimum configured map size is 128 KiB for the new B-tree catalog.
+
+## Current complete-key API (append4-single-3)
+
+New applications use `Append4.KV`. `getValue`, `putValue`, prefix/range reads,
+transactions and snapshots operate on `Text` keys and `Append4.Flat.Atom` values.
+Only scalars and empty-container sentinels are accepted. Each complete key maps
+directly to its binary value in its namespace; nonempty containers have no root
+record or field-path index. `Append4.Key` is an optional in-memory serializer for
+application boundaries, not a persisted document API.
+
+Ordinary keys are directly readable UTF-8 B-tree keys. Keys over 500 bytes use
+`.long-keys`/`.long-values` overflow B-trees with collision checks and identical
+prefix/range semantics. Audit and metadata use the same scalar representation.
+
+`Append4.Convert` converts a closed v2 store into a new v3 file and verifies all
+current values and historical replay. Original transaction records are retained
+as scalar keys in `prior-history`, including original conditions and no-op writes.
+The application owns version markers, backup retention and atomic publication.
+The old APIs/codecs remain frozen for migration inputs only.
