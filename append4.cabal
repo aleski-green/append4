@@ -12,7 +12,8 @@ library
   c-sources: cbits/lmdb/mdb.c, cbits/lmdb/midl.c
   include-dirs: cbits/lmdb
   install-includes: lmdb.h, midl.h
-  hsc2hs-options: --cross-compile --via-asm
+  if os(windows)
+    hsc2hs-options: --cross-compile --via-asm
   default-language: Haskell2010
   default-extensions: OverloadedStrings, ScopedTypeVariables, DeriveGeneric
   ghc-options: -Wall -Werror=incomplete-patterns
