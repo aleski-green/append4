@@ -4,3 +4,6 @@ dist-newstyle/
 .lake/
 *.append4
 *.append4.lock
+*.lmdb
+*.lmdb-lock
+*.lmdb.lock

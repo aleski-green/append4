@@ -18,6 +18,7 @@ import Data.Binary.Put (runPut, putWord64be)
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Lazy as L
 import Data.IORef
+import Data.List (foldl')
 import qualified Data.Map.Strict as M
 import Data.Maybe
 import Data.Text (Text)
