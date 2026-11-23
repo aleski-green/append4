@@ -132,6 +132,14 @@ checks path = do
  recovered <- bracket (A.openStore path) A.closeStore A.readSnapshot
  persistentDuplicate <- bracket (A.openStore path) A.closeStore $ \reopened ->
   A.submit reopened (A.Transaction "one" [] [A.Set "role" Null]) >>= A.await
+ -- Inspect an immutable backup without changing it or creating lock files.
+ let backup = path<.>"backup"
+ copyFile path backup
+ backupBefore <- B.readFile backup
+ offline <- A.getOfflineValue backup "role"
+ backupAfter <- B.readFile backup
+ offlineLock <- doesFileExist (backup<.>"lock")
+ nativeLock <- doesFileExist (backup++"-lock")
  -- Capacity exhaustion must abort the entire transaction and fail closed.
  let small = A.defaultOptions { A.initialMapBytes = 65536, A.maximumMapBytes = 65536 }
  broken <- A.openStoreWith small (path<.>"full")
@@ -181,6 +189,7 @@ checks path = do
   , "concurrentAuthors" .= (counter==Just (toJSON (32 :: Int)))
   , "closeDrains" .= (closed==A.Accepted (A.version recovered) && closedReject)
   , "recovery" .= (M.lookup "first" (A.entries recovered)==Just (Bool True) && M.lookup "receipts/request" (A.entries recovered)==Just (String "done"))
+  , "immutableBackupRead" .= (offline==Just (String "closed") && backupBefore==backupAfter && not offlineLock && not nativeLock)
   , "failedCommit" .= (failed && admissionFailed && closeFailed && M.null (A.entries intact))
   , "mapGrowth" .= (grew==Just (String (T.replicate 200000 "y")) && runCount==1)
   , "boundedTransientStorage" .= (null retained && isNothing old && isNothing live && transientBytes<2*1024*1024)

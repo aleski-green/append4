@@ -65,6 +65,17 @@ setMapSize env bytes = do
  when (bytes <= 0 || bytes > toInteger (maxBound :: CSize)) $ fail "Append4: invalid LMDB map size"
  setMapSizeRaw env (fromInteger bytes) >>= check
 
+-- Only for an immutable backup or an externally locked, stopped store. NOLOCK
+-- avoids creating/changing lock files while a backup inventory is verified.
+openOffline :: FilePath -> IO Env
+openOffline path = mask_ $ do
+ env <- alloca $ \out -> envCreate out >>= check >> peek out
+ flip onException (close env) $ do
+  setMaxDBs env 8 >>= check
+  B.useAsCString (TE.encodeUtf8 (T.pack path)) $ \name ->
+   envOpen env name (#{const MDB_NOSUBDIR} + #{const MDB_NOTLS} + #{const MDB_RDONLY} + #{const MDB_NOLOCK}) 0 >>= check
+  pure env
+
 sync :: Env -> IO ()
 sync env = syncRaw env 1 >>= check
 
@@ -88,6 +99,11 @@ write env action = mask_ $ do
 openDB :: Txn -> String -> IO DB
 openDB txn name = withCString name $ \key -> alloca $ \out -> do
  dbOpenRaw txn key #{const MDB_CREATE} out >>= check
+ peek out
+
+existingDB :: Txn -> String -> IO DB
+existingDB txn name = withCString name $ \key -> alloca $ \out -> do
+ dbOpenRaw txn key 0 out >>= check
  peek out
 
 withValue :: B.ByteString -> (Ptr () -> IO a) -> IO a

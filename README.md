@@ -57,6 +57,8 @@ Long-lived readers delay page reuse and resizing. A capacity failure rolls back
 the entire transaction and fails closed; reopen with a larger configured ceiling.
 
 Files are the data path, LMDB's -lock file and Append4's .lock ownership file.
+getOfflineValue inspects a stopped store or immutable backup without changing
+data or lock files. The caller must exclude all writers; it is not a live-read API.
 Use local filesystems. Existing Append4 journals are not LMDB files and cannot be
 opened with this version. This is a fresh-data change, with no format migration.
 

@@ -4,7 +4,8 @@ module Append4
  ( Store, Snapshot(..), Mutation(..), Transaction(..), Outcome(..), Append(..)
  , HistoryPolicy(..), Options(..), defaultOptions, openStore, openStoreWith
  , closeStore, submit, flush, await, readSnapshot, snapshotAt, history, historyPage
- , transaction, getValue, putValue, deleteValue, values, rangeValues, afterCommit ) where
+ , transaction, getValue, putValue, deleteValue, values, rangeValues, afterCommit
+ , getOfflineValue ) where
 
 import qualified Append4.LMDB as DB
 import Control.Concurrent
@@ -147,6 +148,17 @@ readVersion :: Store -> DB.Txn -> IO Integer
 readVersion store txn = DB.get txn (metaDB (databases store)) "version" >>= maybe (pure 0) decoded
 readValue :: Store -> DB.Txn -> Text -> IO (Maybe Value)
 readValue store txn key = DB.get txn (databaseFor store key) (TE.encodeUtf8 key) >>= traverse decoded
+
+-- Caller must exclude every writer (including other processes), or use an
+-- immutable backup. This opens read-only without touching data or lock files.
+getOfflineValue :: FilePath -> Text -> IO (Maybe Value)
+getOfflineValue path key = bracket (DB.openOffline path) DB.close $ \env ->
+ bracket (DB.begin env True) DB.abort $ \txn -> do
+  let name | "receipts/" `T.isPrefixOf` key = "receipts"
+           | "expiry/" `T.isPrefixOf` key = "expiry"
+           | otherwise = "state"
+  db <- DB.existingDB txn name
+  DB.get txn db (TE.encodeUtf8 key) >>= traverse decoded
 validateKey :: Store -> Text -> IO ()
 validateKey store key = unless (not (T.null key) && B.length (TE.encodeUtf8 key) <= keyLimit store) $
  fail "Append4: empty or oversized LMDB key"

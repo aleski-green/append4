@@ -11,7 +11,7 @@ def main (args : List String) : IO UInt32 := do
     let facts ← IO.ofExcept <| Json.parse observed.stdout
     for name in ["emptyFlush","commitWithoutClock","noChange","noCrossTransactionNetting",
       "snapshotIsolation","historicalRead","atomicConflict","orderedValidation","duplicate","concurrentValidation","rollback",
-      "afterCommit","prefixAndRange","cancelledAuthor","concurrentAuthors","closeDrains","recovery",
+      "afterCommit","prefixAndRange","cancelledAuthor","concurrentAuthors","closeDrains","recovery","immutableBackupRead",
       "failedCommit","mapGrowth","boundedTransientStorage","historyPolicy","legacyRejected","exclusiveWriter"] do
       unless (← IO.ofExcept <| facts.getObjValAs? Bool name) do throw <| IO.userError s!"FAIL {name}"
       IO.println s!"PASS {name}"
