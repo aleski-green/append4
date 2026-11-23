@@ -1,40 +1,35 @@
-{-# LANGUAGE CPP, ForeignFunctionInterface #-}
--- Embedded append-only KV. The caller supplies flushes; there is no clock here.
+{-# LANGUAGE CPP #-}
+-- Transactional KV over LMDB. Commits are driven by demand, never by a clock.
 module Append4
  ( Store, Snapshot(..), Mutation(..), Transaction(..), Outcome(..), Append(..)
- , openStore, closeStore, submit, flush, await, readSnapshot, snapshotAt, history
- , transaction, getValue, putValue, deleteValue, values, afterCommit ) where
+ , HistoryPolicy(..), Options(..), defaultOptions, openStore, openStoreWith
+ , closeStore, submit, flush, await, readSnapshot, snapshotAt, history, historyPage
+ , transaction, getValue, putValue, deleteValue, values, rangeValues, afterCommit ) where
 
+import qualified Append4.LMDB as DB
 import Control.Concurrent
 import Control.Concurrent.Async
 import Control.Concurrent.STM
 import Control.Exception
 import Control.Monad
-import Crypto.Hash.SHA256 (hash)
-import Data.Aeson
-import Data.Binary.Get (runGet, getWord64be)
+import Data.Aeson hiding (Options, defaultOptions)
 import Data.Binary.Put (runPut, putWord64be)
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Lazy as L
-import Data.Foldable (toList)
 import Data.IORef
 import qualified Data.Map.Strict as M
-import qualified Data.Sequence as Q
+import Data.Maybe
 import Data.Text (Text)
 import qualified Data.Text as T
+import qualified Data.Text.Encoding as TE
+import Data.Word
 import GHC.Generics (Generic)
 import System.Directory
 import System.FileLock
 import System.FilePath
-import System.IO
-#ifdef mingw32_HOST_OS
-import Foreign.C
-foreign import ccall unsafe "_wopen" c_open :: CWString -> CInt -> CInt -> IO CInt
-foreign import ccall unsafe "_commit" c_sync :: CInt -> IO CInt
-foreign import ccall unsafe "_close" c_close :: CInt -> IO CInt
-#else
-import qualified System.Posix.IO as P
-import qualified System.Posix.Unistd as P
+#ifndef mingw32_HOST_OS
+import qualified System.Posix.IO as Posix
+import qualified System.Posix.Unistd as Posix
 #endif
 
 data Mutation = Set Text Value | Delete Text deriving (Eq, Show, Generic)
@@ -49,224 +44,320 @@ data Append = Append { appendId :: Integer, transactions :: [Transaction] } deri
 instance ToJSON Append
 instance FromJSON Append
 data Snapshot = Snapshot { version :: Integer, entries :: M.Map Text Value } deriving (Eq, Show)
-data State = State Snapshot (Q.Seq Append) B.ByteString
-type Ticket = TMVar (Either SomeException Outcome)
-data Queued = Queued Transaction (Maybe (M.Map Text Value)) Ticket
-data Command = Flush (TMVar (Either SomeException ())) | Close (TMVar (Either SomeException ()))
-data Local = Local ThreadId (IORef (Snapshot,[Mutation],[IO ()]))
-data Store = Store
- { committed :: TVar State, pending :: TQueue Queued, commands :: TQueue Command
- , health :: TVar (Maybe SomeException), closing :: TVar Bool, writer :: Async ()
- , author :: MVar (), local :: IORef (Maybe Local), nonce :: IORef Integer }
+data HistoryPolicy = KeepHistory | CurrentOnly deriving (Eq, Show)
+data Options = Options { historyPolicy :: HistoryPolicy, initialMapBytes :: Integer, maximumMapBytes :: Integer } deriving Show
+defaultOptions :: Options
+defaultOptions = Options KeepHistory (16*1024*1024) (64*1024*1024*1024)
 
+type Ticket = TMVar (Either SomeException Outcome)
+data Command = Write Transaction (Maybe Integer) Ticket | Barrier (TMVar (Either SomeException ())) | Close
+data Databases = Databases { stateDB :: DB.DB, receiptsDB :: DB.DB, expiryDB :: DB.DB, auditDB :: DB.DB, metaDB :: DB.DB }
+data Stage = Stage { changes :: M.Map Text (Maybe Value), operations :: [Mutation], effects :: [IO ()] }
+data Local = Local ThreadId DB.Txn (IORef Stage)
+data Store = Store
+ { environment :: DB.Env, databases :: Databases, options :: Options
+ , commands :: TQueue Command, health :: TVar (Maybe SomeException), closing :: TVar Bool
+ , readers :: TVar (Bool,Int), mapBytes :: IORef Integer, writer :: Async ()
+ , author :: MVar (), local :: IORef (Maybe Local), keyLimit :: Int }
+
+encoded :: ToJSON a => a -> B.ByteString
+encoded = L.toStrict . encode
+decoded :: FromJSON a => B.ByteString -> IO a
+decoded = either (fail . ("Append4: invalid stored JSON: "++)) pure . eitherDecodeStrict
+versionKey :: Integer -> B.ByteString
+versionKey = L.toStrict . runPut . putWord64be . fromInteger
+keyOf :: Mutation -> Text
+keyOf (Set key _) = key
+keyOf (Delete key) = key
 apply :: M.Map Text Value -> [Mutation] -> M.Map Text Value
-apply = foldl step where
+apply = foldl' step where
  step kv (Set key value) = M.insert key value kv
  step kv (Delete key) = M.delete key kv
-
--- Complete records are checked against their predecessor. Only an incomplete
--- final frame is discarded. A complete frame with a bad checksum rejects the journal.
-recover :: Handle -> IO State
-recover h = go 0 (State (Snapshot 0 M.empty) Q.empty (B.replicate 32 0)) where
- go offset state@(State snap past previous) = do
-  header <- B.hGet h 8
-  if B.null header then pure state else if B.length header < 8 then trim offset state else do
-   let size = runGet getWord64be (L.fromStrict header)
-   when (size == 0 || size > 64*1024*1024) $ fail "Append4: invalid frame size"
-   payload <- B.hGet h (fromIntegral size)
-   digest <- B.hGet h 32
-   if B.length payload /= fromIntegral size || B.length digest /= 32 then trim offset state else do
-    unless (digest == hash (previous <> header <> payload)) $ fail "Append4: checksum mismatch"
-    item <- either fail pure (eitherDecodeStrict payload)
-    unless (appendId item == version snap+1 && not (null (transactions item))) $ fail "Append4: invalid append order"
-    let next = Snapshot (appendId item) (foldl (\kv tx -> apply kv (mutations tx)) (entries snap) (transactions item))
-    go (offset+8+fromIntegral size+32) (State next (past Q.|> item) digest)
- trim offset state = hSetFileSize h offset >> pure state
-
-syncFile :: FilePath -> IO ()
-#ifdef mingw32_HOST_OS
-syncFile path = withCWString path $ \name -> bracket (c_open name 32770 0) (void . c_close) $ \fd -> do
- when (fd < 0) $ fail "Append4: cannot open sync descriptor"
- result <- c_sync fd
- unless (result == 0) $ fail "Append4: sync failed"
-#else
-syncFile path = bracket (P.openFd path P.ReadOnly P.defaultFileFlags) P.closeFd P.fileSynchronise
-#endif
+applyChange :: M.Map Text (Maybe Value) -> Mutation -> M.Map Text (Maybe Value)
+applyChange kv (Set key value) = M.insert key (Just value) kv
+applyChange kv (Delete key) = M.insert key Nothing kv
 
 openStore :: FilePath -> IO Store
-openStore path = mask $ \restore -> do
+openStore = openStoreWith defaultOptions
+openStoreWith :: Options -> FilePath -> IO Store
+openStoreWith config path = mask_ $ do
+ unless (initialMapBytes config >= 65536 && maximumMapBytes config >= initialMapBytes config) $
+  fail "Append4: invalid LMDB capacity settings"
  createDirectoryIfMissing True (takeDirectory path)
  lock <- tryLockFile (path <.> "lock") Exclusive >>= maybe (fail "Append4: store already open") pure
  flip onException (unlockFile lock) $ do
-  h <- openBinaryFile path ReadWriteMode
-  flip onException (hClose h) $ do
-   state <- restore (recover h)
-   hSeek h SeekFromEnd 0
-   hFlush h
-   syncFile path
+  exists <- doesFileExist path
+  size <- if exists then getFileSize path else pure 0
+  let capacity = min (maximumMapBytes config) (max (initialMapBytes config) (((size*2+4095) `div` 4096)*4096))
+  when (size > maximumMapBytes config) $ fail "Append4: database exceeds configured LMDB capacity"
+  env <- DB.open path capacity
+  flip onException (DB.close env) $ do
+   dbs <- runInBoundThread $ DB.write env $ \txn -> do
+    dbs <- Databases <$> DB.openDB txn "state" <*> DB.openDB txn "receipts"
+      <*> DB.openDB txn "expiry" <*> DB.openDB txn "audit" <*> DB.openDB txn "metadata"
+    let format = encoded ("append4-lmdb-1" :: Text, show (historyPolicy config))
+    previous <- DB.get txn (metaDB dbs) "format"
+    case previous of
+     Nothing -> DB.put txn (metaDB dbs) "format" format
+     Just saved -> unless (saved == format) $ fail "Append4: incompatible format or history policy"
+    pure dbs
 #ifndef mingw32_HOST_OS
-   syncFile (takeDirectory path)
+   -- Make a newly created data-file name durable as well as its contents.
+   bracket (Posix.openFd (takeDirectory path) Posix.ReadOnly Posix.defaultFileFlags) Posix.closeFd Posix.fileSynchronise
 #endif
-   snapshot <- newTVarIO state
    queue <- newTQueueIO
-   control <- newTQueueIO
    failed <- newTVarIO Nothing
    stopped <- newTVarIO False
+   access <- newTVarIO (False,0)
+   capacityRef <- newIORef capacity
    mutex <- newMVar ()
    working <- newIORef Nothing
-   counter <- newIORef 0
-   worker <- async (runWriter path h snapshot queue control failed `finally` (hClose h `finally` unlockFile lock))
-   pure (Store snapshot queue control failed stopped worker mutex working counter)
+   limit <- fromIntegral <$> DB.maxKeySize env
+   start <- newEmptyMVar
+   worker <- asyncBound ((takeMVar start >>= runWriter) `finally` (DB.close env `finally` unlockFile lock))
+   let store = Store env dbs config queue failed stopped access capacityRef worker mutex working limit
+   putMVar start store
+   pure store
 
 ensureOpen :: Store -> STM ()
 ensureOpen store = do
  readTVar (health store) >>= mapM_ throwSTM
  readTVar (closing store) >>= flip when (throwSTM (userError "Append4: store closed"))
+
+-- MDB_NOTLS allows a read transaction to follow a Haskell thread between OS
+-- threads. Exclusive resize waits for readers; no mapped pointer escapes.
+withReader :: Store -> (DB.Txn -> IO a) -> IO a
+withReader store action = bracket_ acquire release $
+ bracket (DB.begin (environment store) True) DB.abort action
+ where
+ acquire = atomically $ do
+  ensureOpen store
+  (resizing,count) <- readTVar (readers store)
+  check (not resizing)
+  writeTVar (readers store) (False,count+1)
+ release = atomically $ modifyTVar' (readers store) (\(busy,n) -> (busy,n-1))
+
+databaseFor :: Store -> Text -> DB.DB
+databaseFor store key
+ | "receipts/" `T.isPrefixOf` key = receiptsDB dbs
+ | "expiry/" `T.isPrefixOf` key = expiryDB dbs
+ | otherwise = stateDB dbs
+ where dbs = databases store
+readVersion :: Store -> DB.Txn -> IO Integer
+readVersion store txn = DB.get txn (metaDB (databases store)) "version" >>= maybe (pure 0) decoded
+readValue :: Store -> DB.Txn -> Text -> IO (Maybe Value)
+readValue store txn key = DB.get txn (databaseFor store key) (TE.encodeUtf8 key) >>= traverse decoded
+validateKey :: Store -> Text -> IO ()
+validateKey store key = unless (not (T.null key) && B.length (TE.encodeUtf8 key) <= keyLimit store) $
+ fail "Append4: empty or oversized LMDB key"
+
 submit :: Store -> Transaction -> IO Ticket
-submit store tx = enqueue store tx Nothing
-enqueue :: Store -> Transaction -> Maybe (M.Map Text Value) -> IO Ticket
-enqueue store tx expected = atomically $ do
- ensureOpen store
- result <- newEmptyTMVar
- writeTQueue (pending store) (Queued tx expected result)
- pure result
+submit store tx = do
+ validateKey store ("id/" <> transactionId tx)
+ enqueue store tx Nothing
+enqueue :: Store -> Transaction -> Maybe Integer -> IO Ticket
+enqueue store tx expected = do
+ mapM_ (validateKey store) (map keyOf (mutations tx) ++ map fst (conditions tx))
+ atomically $ do
+  ensureOpen store
+  result <- newEmptyTMVar
+  writeTQueue (commands store) (Write tx expected result)
+  pure result
 await :: Ticket -> IO Outcome
 await ticket = atomically (readTMVar ticket) >>= either throwIO pure
+-- Compatibility barrier: all earlier submissions are already durable when it
+-- returns. Applications do not need periodic flush calls.
 flush :: Store -> IO ()
 flush store = do
  result <- atomically $ do
   ensureOpen store
   reply <- newEmptyTMVar
-  writeTQueue (commands store) (Flush reply)
+  writeTQueue (commands store) (Barrier reply)
   pure reply
  atomically (readTMVar result) >>= either throwIO pure
 closeStore :: Store -> IO ()
 closeStore store = mask_ $ do
- result <- atomically $ do
+ atomically $ do
   stopped <- readTVar (closing store)
-  writeTVar (closing store) True
-  if stopped then pure Nothing else do
-   reply <- newEmptyTMVar
-   writeTQueue (commands store) (Close reply)
-   pure (Just reply)
- (forM_ result $ \ticket -> atomically (readTMVar ticket) >>= either throwIO pure) `finally` wait (writer store)
+  unless stopped $ writeTVar (closing store) True >> writeTQueue (commands store) Close
+ wait (writer store)
  readTVarIO (health store) >>= mapM_ throwIO
 
-runWriter :: FilePath -> Handle -> TVar State -> TQueue Queued -> TQueue Command -> TVar (Maybe SomeException) -> IO ()
-runWriter path h snapshot queue control failed = loop where
+-- The worker is bound to one OS thread for the entire LMDB write transaction.
+-- Map-full retries replay only prepared mutations, never application IO.
+runWriter :: Store -> IO ()
+runWriter store = loop where
  loop = do
-  command <- atomically (readTQueue control)
-  batch <- atomically (flushTQueue queue)
-  result <- try $ do
-   readTVarIO failed >>= mapM_ throwIO
-   state <- readTVarIO snapshot
-   commit state batch
-  case result of
-   Left err -> atomically $ do
-    writeTVar failed (Just err)
-    remaining <- flushTQueue queue
-    mapM_ (\(Queued _ _ ticket) -> void (tryPutTMVar ticket (Left err))) (batch++remaining)
-   Right () -> pure ()
+  command <- atomically (readTQueue (commands store))
   case command of
-   Flush reply -> atomically (putTMVar reply result) >> loop
-   Close reply -> atomically (putTMVar reply result)
- commit (State before past previous) batch = do
-  let priorIds = M.fromList [(transactionId t,()) | a <- toList past, t <- transactions a]
-      choose (kv,ids,accepted,outcomes) (Queued tx expected ticket)
-       | maybe False (/=kv) expected = reject Conflict
-       | null (mutations tx) = reject Empty
-       | M.member (transactionId tx) ids = reject Duplicate
-       | any (\(k,v) -> M.lookup k kv /= v) (conditions tx) = reject Conflict
-       | after == kv = reject NoChange
-       | otherwise = (after,M.insert (transactionId tx) () ids,tx:accepted,(ticket,Accepted (version before+1)):outcomes)
-       where after=apply kv (mutations tx)
-             reject reason=(kv,ids,accepted,(ticket,reason):outcomes)
-      (kv,_,accepted,outcomes) = foldl choose (entries before,priorIds,[],[]) batch
-      item = Append (version before+1) (reverse accepted)
-      payload = L.toStrict (encode item)
-      header = L.toStrict (runPut (putWord64be (fromIntegral (B.length payload))))
-      digest = hash (previous <> header <> payload)
-  unless (null accepted) $ do
-   when (B.length payload > 64*1024*1024) $ fail "Append4: batch exceeds 64 MiB"
-   B.hPut h (header <> payload <> digest)
-   hFlush h
-   syncFile path
-  atomically $ do
-   unless (null accepted) $ writeTVar snapshot (State (Snapshot (appendId item) kv) (past Q.|> item) digest)
-   forM_ outcomes $ \(ticket,result) -> putTMVar ticket (Right result)
+   Close -> atomically $ readTVar (readers store) >>= check . ((==0) . snd)
+   Barrier reply -> do
+    failure <- readTVarIO (health store)
+    atomically (putTMVar reply (maybe (Right ()) Left failure))
+    loop
+   Write tx expected reply -> do
+    result <- try $ do
+     readTVarIO (health store) >>= mapM_ throwIO
+     commitWithGrowth store tx expected
+    case result of
+     Left err -> atomically (writeTVar (health store) (Just err))
+     Right _ -> pure ()
+    atomically (putTMVar reply result)
+    loop
 
-readSnapshot :: Store -> IO Snapshot
-readSnapshot store = do
- readTVarIO (health store) >>= mapM_ throwIO
- State snap _ _ <- readTVarIO (committed store)
- pure snap
-snapshotAt :: Store -> Integer -> IO (Maybe Snapshot)
-snapshotAt store number = do
- State current past _ <- readTVarIO (committed store)
- pure $ if number<0 || number>version current then Nothing else Just
-  (Snapshot number (foldl (\kv item -> foldl (\state tx -> apply state (mutations tx)) kv (transactions item)) M.empty (takeWhile ((<=number) . appendId) (toList past))))
-history :: Store -> IO [Append]
-history store = do State _ past _ <- readTVarIO (committed store); pure (toList past)
+commitWithGrowth :: Store -> Transaction -> Maybe Integer -> IO Outcome
+commitWithGrowth store tx expected = commitTransaction store tx expected `catch` \(err :: DB.Error) -> do
+ old <- readIORef (mapBytes store)
+ let next = min (maximumMapBytes (options store)) (old*2)
+ if not (DB.isMapFull err) || next <= old then throwIO err else do
+  bracket_ (atomically $ modifyTVar' (readers store) (\(_,n) -> (True,n)))
+   (atomically $ modifyTVar' (readers store) (\(_,n) -> (False,n))) $ do
+    atomically $ readTVar (readers store) >>= check . ((==0) . snd)
+    DB.setMapSize (environment store) next
+    writeIORef (mapBytes store) next
+  commitWithGrowth store tx expected
 
--- A host transaction stages all nested writes and discards them on exceptions.
--- Reads from other threads see only committed snapshots. The author lock spans
--- acknowledgment, so a second host transaction cannot derive from stale values.
-current :: Store -> IO (Maybe (IORef (Snapshot,[Mutation],[IO ()])))
+commitTransaction :: Store -> Transaction -> Maybe Integer -> IO Outcome
+commitTransaction store submitted expected = DB.write (environment store) $ \txn -> do
+ before <- readVersion store txn
+ let meta = metaDB (databases store)
+     explicit = isNothing expected
+     ident = if explicit then transactionId submitted else "local:" <> T.pack (show (before+1))
+     tx = submitted { transactionId = ident }
+ duplicate <- if explicit then isJust <$> DB.get txn meta (TE.encodeUtf8 ("id/"<>ident)) else pure False
+ matches <- and <$> forM (conditions tx) (\(key,value) -> (==value) <$> readValue store txn key)
+ original <- M.traverseWithKey (\key _ -> readValue store txn key) (M.fromList [(keyOf op,()) | op <- mutations tx])
+ let changed = foldl' applyChange original (mutations tx)
+ if maybe False (/=before) expected then pure Conflict
+ else if null (mutations tx) then pure Empty
+ else if duplicate then pure Duplicate
+ else if not matches then pure Conflict
+ else if changed == original then pure NoChange
+ else do
+  when (before >= toInteger (maxBound :: Word64)) $ fail "Append4: version exhausted"
+  let number = before+1
+  forM_ (M.toList changed) $ \(key,value) -> when (M.lookup key original /= Just value) $
+   maybe (DB.delete txn (databaseFor store key) (TE.encodeUtf8 key))
+    (DB.put txn (databaseFor store key) (TE.encodeUtf8 key) . encoded) value
+  DB.put txn meta "version" (encoded number)
+  when explicit $ DB.put txn meta (TE.encodeUtf8 ("id/"<>ident)) (encoded number)
+  when (historyPolicy (options store) == KeepHistory) $
+   DB.put txn (auditDB (databases store)) (versionKey number) (encoded (Append number [tx]))
+  pure (Accepted number)
+
+current :: Store -> IO (Maybe (DB.Txn,IORef Stage))
 current store = do
  thread <- myThreadId
  working <- readIORef (local store)
- pure $ case working of Just (Local owner ref) | owner == thread -> Just ref; _ -> Nothing
+ pure $ case working of Just (Local owner txn ref) | owner == thread -> Just (txn,ref); _ -> Nothing
+
 transaction :: Store -> IO a -> IO a
 transaction store action = do
  nested <- current store
  case nested of
   Just _ -> action
   Nothing -> mask $ \restore -> do
-   (result,effects,interrupted) <- withMVar (author store) $ \_ -> do
-    atomically (ensureOpen store)
-    snap <- readSnapshot store
-    thread <- myThreadId
-    ref <- newIORef (snap,[],[])
-    writeIORef (local store) (Just (Local thread ref))
-    let reset = writeIORef (local store) Nothing
-    (do result <- restore action
-        (_,ops,effects) <- readIORef ref
-        interrupted <- if null ops then pure Nothing else do
-         serial <- atomicModifyIORef' (nonce store) (\n -> (n+1,n+1))
-         ticket <- enqueue store (Transaction (T.pack (show (version snap) ++ ":" ++ show serial)) [] (reverse ops)) (Just (entries snap))
-         completion <- try (await ticket)
-         (outcome,interrupted) <- case completion of
-          Right value -> pure (value,Nothing)
-          Left err | Just (_::SomeAsyncException) <- fromException err -> do
-           -- Resolve an enqueued transaction before releasing its author. Otherwise
-           -- a cancelled waiter can leave a later transaction based on stale state.
-           flush store
-           value <- await ticket
-           pure (value,Just err)
-          Left err -> throwIO (err::SomeException)
-         case outcome of
-          Accepted _ -> pure ()
-          NoChange -> pure ()
-          _ -> fail ("Append4: transaction rejected: "++show outcome)
-         pure interrupted
-        reset
-        pure (result,reverse effects,interrupted)) `onException` reset
-   sequence_ effects
+   (result,callbacks,interrupted) <- withMVar (author store) $ \_ -> do
+    (result,before,stage) <- withReader store $ \txn -> do
+     before <- readVersion store txn
+     thread <- myThreadId
+     ref <- newIORef (Stage M.empty [] [])
+     writeIORef (local store) (Just (Local thread txn ref))
+     flip finally (writeIORef (local store) Nothing) $ do
+      result <- restore action
+      stage <- readIORef ref
+      pure (result,before,stage)
+    interrupted <- if null (operations stage) then pure Nothing else do
+     ticket <- enqueue store (Transaction "" [] (reverse (operations stage))) (Just before)
+     completion <- try (await ticket)
+     (outcome,interrupted) <- case completion of
+      Right outcome -> pure (outcome,Nothing)
+      Left err | Just (_ :: SomeAsyncException) <- fromException err -> do
+       outcome <- uninterruptibleMask_ (await ticket)
+       pure (outcome,Just err)
+      Left err -> throwIO (err :: SomeException)
+     case outcome of
+      Accepted _ -> pure ()
+      NoChange -> pure ()
+      _ -> fail ("Append4: transaction rejected: " ++ show outcome)
+     pure interrupted
+    pure (result,reverse (effects stage),interrupted)
+   sequence_ callbacks
    mapM_ throwIO interrupted
    pure result
+
 getValue :: Store -> Text -> IO (Maybe Value)
-getValue store key = M.lookup key . entries <$> view store
-view :: Store -> IO Snapshot
-view store = current store >>= maybe (readSnapshot store) (fmap (\(s,_,_) -> s) . readIORef)
-values :: Store -> Text -> IO [(Text,Value)]
-values store prefix = filter (T.isPrefixOf prefix . fst) . M.toAscList . entries <$> view store
+getValue store key = do
+ validateKey store key
+ current store >>= maybe (withReader store (\txn -> readValue store txn key))
+  (\(txn,ref) -> readIORef ref >>= maybe (readValue store txn key) pure . M.lookup key . changes)
 putValue :: Store -> Text -> Value -> IO ()
 putValue store key value = mutate store (Set key value)
 deleteValue :: Store -> Text -> IO ()
 deleteValue store key = mutate store (Delete key)
 mutate :: Store -> Mutation -> IO ()
-mutate store op = transaction store $ do
- Just ref <- current store
- modifyIORef' ref $ \(s,ops,effects) -> (s {entries=apply (entries s) [op]},op:ops,effects)
+mutate store op = do
+ validateKey store (keyOf op)
+ transaction store $ current store >>= \working -> case working of
+  Nothing -> fail "Append4: missing transaction context"
+  Just (_,ref) -> modifyIORef' ref $ \stage -> stage
+   { changes = applyChange (changes stage) op, operations = op : operations stage }
 afterCommit :: Store -> IO () -> IO ()
-afterCommit store effect = current store >>= maybe effect (\ref -> modifyIORef' ref (\(s,ops,es) -> (s,ops,effect:es)))
+afterCommit store effect = current store >>= maybe effect
+ (\(_,ref) -> modifyIORef' ref (\stage -> stage { effects = effect : effects stage }))
+
+values :: Store -> Text -> IO [(Text,Value)]
+values store prefix = viewRange store prefix Nothing (Just prefix) maxBound
+rangeValues :: Store -> Text -> Text -> Int -> IO [(Text,Value)]
+rangeValues store lower upper = viewRange store lower (Just upper) Nothing
+viewRange :: Store -> Text -> Maybe Text -> Maybe Text -> Int -> IO [(Text,Value)]
+viewRange store lower upper prefix limit = current store >>= maybe
+ (withReader store (\txn -> scanValues store txn lower upper prefix limit))
+ (\(txn,ref) -> do
+   staged <- changes <$> readIORef ref
+   let count = fromInteger (min (toInteger (maxBound :: Int)) (toInteger limit + toInteger (M.size staged)))
+   rows <- M.fromList <$> scanValues store txn lower upper prefix count
+   let inside key = key >= lower && maybe True (key <) upper && maybe True (`T.isPrefixOf` key) prefix
+       overlay = M.filterWithKey (\key _ -> inside key) staged
+       merged = M.foldlWithKey' (\kv key value -> maybe (M.delete key kv) (\v -> M.insert key v kv) value) rows overlay
+   pure (take limit (M.toAscList merged)))
+scanValues :: Store -> DB.Txn -> Text -> Maybe Text -> Maybe Text -> Int -> IO [(Text,Value)]
+scanValues store txn lower upper prefix limit = do
+ let dbs = databases store
+     selected = case prefix of
+      Just p | "receipts/" `T.isPrefixOf` p -> [receiptsDB dbs]
+      Just p | "expiry/" `T.isPrefixOf` p -> [expiryDB dbs]
+      _ -> [stateDB dbs,receiptsDB dbs,expiryDB dbs]
+ raw <- concat <$> mapM (\db -> DB.scan txn db (TE.encodeUtf8 lower) (TE.encodeUtf8 <$> upper) (TE.encodeUtf8 <$> prefix) limit) selected
+ rows <- forM raw $ \(key,value) -> do
+  name <- either throwIO pure (TE.decodeUtf8' key)
+  parsed <- decoded value
+  pure (name,parsed)
+ pure (take limit (M.toAscList (M.fromList rows)))
+
+readSnapshot :: Store -> IO Snapshot
+readSnapshot store = withReader store $ \txn -> Snapshot <$> readVersion store txn
+ <*> (M.fromList <$> scanValues store txn "" Nothing Nothing maxBound)
+historyPage :: Store -> Integer -> Int -> IO [Append]
+historyPage store after limit = withReader store $ \txn ->
+ if historyPolicy (options store) == CurrentOnly || after >= toInteger (maxBound :: Word64) then pure [] else do
+  rows <- DB.scan txn (auditDB (databases store)) (versionKey (max 0 after+1)) Nothing Nothing limit
+  mapM (decoded . snd) rows
+history :: Store -> IO [Append]
+history store = historyPage store 0 maxBound
+snapshotAt :: Store -> Integer -> IO (Maybe Snapshot)
+snapshotAt store number = withReader store $ \txn -> do
+ latest <- readVersion store txn
+ if number < 0 || number > latest then pure Nothing
+ else if number == 0 then pure (Just (Snapshot 0 M.empty))
+ else if number == latest then Just . Snapshot number . M.fromList <$> scanValues store txn "" Nothing Nothing maxBound
+ else if historyPolicy (options store) == CurrentOnly then pure Nothing
+ else do
+  -- Read history in bounded pages; only the requested snapshot stays resident.
+  let replay after kv = do
+       rows <- DB.scan txn (auditDB (databases store)) (versionKey (after+1)) (Just (versionKey (number+1))) Nothing 128
+       items <- mapM (decoded . snd) rows
+       case items of
+        [] -> pure kv
+        _ -> replay (appendId (last items)) (foldl' (\state item -> foldl' (\s tx -> apply s (mutations tx)) state (transactions item)) kv items)
+  Just . Snapshot number <$> replay 0 M.empty

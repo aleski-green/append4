@@ -1,18 +1,25 @@
 cabal-version: 3.6
 name: append4
-version: 0.1.0.0
+version: 0.2.0.0
 build-type: Simple
 license: LicenseRef-Sustainable-Use-1.0
 license-file: LICENSE.md
+extra-source-files: cbits/lmdb/README.md, cbits/lmdb/LICENSE, cbits/lmdb/COPYRIGHT, cbits/lmdb/CHANGES
 library
   exposed-modules: Append4
+  other-modules: Append4.LMDB
   hs-source-dirs: src
+  c-sources: cbits/lmdb/mdb.c, cbits/lmdb/midl.c
+  include-dirs: cbits/lmdb
+  install-includes: lmdb.h, midl.h
+  hsc2hs-options: --cross-compile --via-asm
   default-language: Haskell2010
   default-extensions: OverloadedStrings, ScopedTypeVariables, DeriveGeneric
   ghc-options: -Wall -Werror=incomplete-patterns
-  build-depends: base >=4.18 && <5, aeson, bytestring, containers, text, stm, async, binary, directory, filepath, filelock, cryptohash-sha256
+  build-depends: base >=4.18 && <5, aeson, bytestring, containers, text, stm, async, binary, directory, filepath, filelock
   if !os(windows)
     build-depends: unix
+    extra-libraries: pthread
 
 executable append4-fixture
   main-is: Fixture.hs

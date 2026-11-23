@@ -9,9 +9,10 @@ def main (args : List String) : IO UInt32 := do
     let observed ← IO.Process.output {cmd := executable, args := #["checks",root.toString]}
     unless observed.exitCode == 0 do throw <| IO.userError observed.stderr
     let facts ← IO.ofExcept <| Json.parse observed.stdout
-    for name in ["emptyFlush","publication","noChange","noCrossTransactionNetting",
+    for name in ["emptyFlush","commitWithoutClock","noChange","noCrossTransactionNetting",
       "snapshotIsolation","historicalRead","atomicConflict","orderedValidation","duplicate","concurrentValidation","rollback",
-      "afterCommit","cancelledWaiter","closeDrains","recovery","incompleteTail","corruption","syncFailure","exclusiveWriter"] do
+      "afterCommit","prefixAndRange","cancelledAuthor","concurrentAuthors","closeDrains","recovery",
+      "failedCommit","mapGrowth","boundedTransientStorage","historyPolicy","legacyRejected","exclusiveWriter"] do
       unless (← IO.ofExcept <| facts.getObjValAs? Bool name) do throw <| IO.userError s!"FAIL {name}"
       IO.println s!"PASS {name}"
   IO.FS.withTempDir fun root => do
@@ -30,7 +31,7 @@ def main (args : List String) : IO UInt32 := do
         throw <| IO.userError "Acknowledged commit lost after killed writer"
     let pending ← IO.Process.spawn {cmd := executable, args := #["uncommitted",root.toString], stdout := .piped}
     try
-      unless (← pending.stdout.getLine).trimAscii.toString == "queued" do throw <| IO.userError "Missing pending transaction"
+      unless (← pending.stdout.getLine).trimAscii.toString == "staged" do throw <| IO.userError "Missing staged transaction"
     finally
       pending.kill
       discard pending.wait
