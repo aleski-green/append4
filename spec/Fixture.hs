@@ -141,7 +141,7 @@ checks path = do
  offlineLock <- doesFileExist (backup<.>"lock")
  nativeLock <- doesFileExist (backup++"-lock")
  -- Capacity exhaustion must abort the entire transaction and fail closed.
- let small = A.defaultOptions { A.initialMapBytes = 65536, A.maximumMapBytes = 65536 }
+ let small = A.defaultOptions { A.initialMapBytes = 131072, A.maximumMapBytes = 131072 }
  broken <- A.openStoreWith small (path<.>"full")
  failed <- rejected $ A.transaction broken $ do
   A.putValue broken "partial" (Bool True)

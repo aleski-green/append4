@@ -77,3 +77,26 @@ The fixture's load mode reports elapsed time for 200 concurrent durable writes.
 
 Target: at most 2,000 first-party Haskell lines and 250 Lean lines. Vendored LMDB
 remains upstream C code, not a second custom storage implementation.
+
+## Flat typed format (append4-flat-2)
+
+New stores contain no serialized JSON. Each namespace has three B-trees:
+`state` maps logical keys to binary root atoms; `state.cells` maps physical field
+IDs to binary atoms; `state.paths` maps those IDs to versioned binary paths. The
+same layout is used for receipts, expiry, audit and metadata (15 B-trees total).
+Atoms are null, boolean, UTF-8 text, exact decimal coefficient/exponent, object
+marker or array-length marker. Empty objects/arrays and null remain distinct.
+There is no schema inference: timestamps originally supplied as text stay text.
+Paths have tagged field-name/index segments. Physical IDs are SHA-256(root key)
+plus SHA-256(binary path), avoiding LMDB's 511-byte limit for nested field names.
+Only changed atoms are written, and removed descendants are deleted atomically.
+The root-key limit still applies to the public logical KV keys.
+
+The Aeson API is an in-memory compatibility view for applications and network
+protocols. It assembles/disassembles the typed cells; it does not encode JSON on
+the new persistence path. Legacy JSON B-trees are recognized only to support an
+explicit application migration. `convertLegacyStorage` copies all five logical
+namespaces, including every historical transaction and duplicate ID, then reads
+back every converted value. It never publishes or deletes the source. The app
+owns version checks, source exclusion, backup, publication and restart recovery.
+The minimum configured map size is 128 KiB for the new B-tree catalog.

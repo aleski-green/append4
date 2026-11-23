@@ -6,7 +6,7 @@ license: LicenseRef-Sustainable-Use-1.0
 license-file: LICENSE.md
 extra-source-files: cbits/lmdb/README.md, cbits/lmdb/LICENSE, cbits/lmdb/COPYRIGHT, cbits/lmdb/CHANGES
 library
-  exposed-modules: Append4
+  exposed-modules: Append4, Append4.Flat
   other-modules: Append4.LMDB
   hs-source-dirs: src
   c-sources: cbits/lmdb/mdb.c, cbits/lmdb/midl.c
@@ -17,7 +17,7 @@ library
   default-language: Haskell2010
   default-extensions: OverloadedStrings, ScopedTypeVariables, DeriveGeneric
   ghc-options: -Wall -Werror=incomplete-patterns
-  build-depends: base >=4.18 && <5, aeson, bytestring, containers, text, stm, async, binary, directory, filepath, filelock
+  build-depends: base >=4.18 && <5, aeson, bytestring, containers, text, stm, async, binary, directory, filepath, filelock, scientific, vector, cryptohash-sha256
   if !os(windows)
     build-depends: unix
     extra-libraries: pthread

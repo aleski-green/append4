@@ -5,8 +5,9 @@ module Append4
  , HistoryPolicy(..), Options(..), defaultOptions, openStore, openStoreWith
  , closeStore, submit, flush, await, readSnapshot, snapshotAt, history, historyPage
  , transaction, getValue, putValue, deleteValue, values, rangeValues, afterCommit
- , getOfflineValue ) where
+ , getOfflineValue, isLegacyStorage, convertLegacyStorage ) where
 
+import qualified Append4.Flat as F
 import qualified Append4.LMDB as DB
 import Control.Concurrent
 import Control.Concurrent.Async
@@ -53,7 +54,7 @@ defaultOptions = Options KeepHistory (16*1024*1024) (64*1024*1024*1024)
 
 type Ticket = TMVar (Either SomeException Outcome)
 data Command = Write Transaction (Maybe Integer) Ticket | Barrier (TMVar (Either SomeException ())) | Close
-data Databases = Databases { stateDB :: DB.DB, receiptsDB :: DB.DB, expiryDB :: DB.DB, auditDB :: DB.DB, metaDB :: DB.DB }
+data Databases = Databases { stateDB :: F.DB, receiptsDB :: F.DB, expiryDB :: F.DB, auditDB :: F.DB, metaDB :: F.DB }
 data Stage = Stage { changes :: M.Map Text (Maybe Value), operations :: [Mutation], effects :: [IO ()] }
 data Local = Local ThreadId DB.Txn (IORef Stage)
 data Store = Store
@@ -62,10 +63,10 @@ data Store = Store
  , readers :: TVar (Bool,Int), mapBytes :: IORef Integer, writer :: Async ()
  , author :: MVar (), local :: IORef (Maybe Local), keyLimit :: Int }
 
-encoded :: ToJSON a => a -> B.ByteString
-encoded = L.toStrict . encode
-decoded :: FromJSON a => B.ByteString -> IO a
-decoded = either (fail . ("Append4: invalid stored JSON: "++)) pure . eitherDecodeStrict
+encoded :: ToJSON a => a -> Value
+encoded = toJSON
+decoded :: FromJSON a => Value -> IO a
+decoded v = case fromJSON v of Error e -> fail e; Success a -> pure a
 versionKey :: Integer -> B.ByteString
 versionKey = L.toStrict . runPut . putWord64be . fromInteger
 keyOf :: Mutation -> Text
@@ -83,7 +84,7 @@ openStore :: FilePath -> IO Store
 openStore = openStoreWith defaultOptions
 openStoreWith :: Options -> FilePath -> IO Store
 openStoreWith config path = mask_ $ do
- unless (initialMapBytes config >= 65536 && maximumMapBytes config >= initialMapBytes config) $
+ unless (initialMapBytes config >= 131072 && maximumMapBytes config >= initialMapBytes config) $
   fail "Append4: invalid LMDB capacity settings"
  createDirectoryIfMissing True (takeDirectory path)
  lock <- tryLockFile (path <.> "lock") Exclusive >>= maybe (fail "Append4: store already open") pure
@@ -95,12 +96,15 @@ openStoreWith config path = mask_ $ do
   env <- DB.open path capacity
   flip onException (DB.close env) $ do
    dbs <- runInBoundThread $ DB.write env $ \txn -> do
-    dbs <- Databases <$> DB.openDB txn "state" <*> DB.openDB txn "receipts"
-      <*> DB.openDB txn "expiry" <*> DB.openDB txn "audit" <*> DB.openDB txn "metadata"
-    let format = encoded ("append4-lmdb-1" :: Text, show (historyPolicy config))
-    previous <- DB.get txn (metaDB dbs) "format"
+    rawMeta <- DB.openDB txn "metadata"
+    rawFormat <- DB.get txn rawMeta "format"
+    let old = maybe False (B.isPrefixOf "[") rawFormat
+    dbs <- Databases <$> F.open old txn "state" <*> F.open old txn "receipts"
+      <*> F.open old txn "expiry" <*> F.open old txn "audit" <*> F.open old txn "metadata"
+    let format = encoded (if old then "append4-lmdb-1" else "append4-flat-2" :: Text, show (historyPolicy config))
+    previous <- F.getValue txn (metaDB dbs) "format"
     case previous of
-     Nothing -> DB.put txn (metaDB dbs) "format" format
+     Nothing -> F.putValue txn (metaDB dbs) "format" format
      Just saved -> unless (saved == format) $ fail "Append4: incompatible format or history policy"
     pure dbs
 #ifndef mingw32_HOST_OS
@@ -139,16 +143,16 @@ withReader store action = bracket_ acquire release $
   writeTVar (readers store) (False,count+1)
  release = atomically $ modifyTVar' (readers store) (\(busy,n) -> (busy,n-1))
 
-databaseFor :: Store -> Text -> DB.DB
+databaseFor :: Store -> Text -> F.DB
 databaseFor store key
  | "receipts/" `T.isPrefixOf` key = receiptsDB dbs
  | "expiry/" `T.isPrefixOf` key = expiryDB dbs
  | otherwise = stateDB dbs
  where dbs = databases store
 readVersion :: Store -> DB.Txn -> IO Integer
-readVersion store txn = DB.get txn (metaDB (databases store)) "version" >>= maybe (pure 0) decoded
+readVersion store txn = F.getValue txn (metaDB (databases store)) "version" >>= maybe (pure 0) decoded
 readValue :: Store -> DB.Txn -> Text -> IO (Maybe Value)
-readValue store txn key = DB.get txn (databaseFor store key) (TE.encodeUtf8 key) >>= traverse decoded
+readValue store txn key = F.getValue txn (databaseFor store key) (TE.encodeUtf8 key) >>= traverse decoded
 
 -- Caller must exclude every writer (including other processes), or use an
 -- immutable backup. This opens read-only without touching data or lock files.
@@ -158,8 +162,11 @@ getOfflineValue path key = bracket (DB.openOffline path) DB.close $ \env ->
   let name | "receipts/" `T.isPrefixOf` key = "receipts"
            | "expiry/" `T.isPrefixOf` key = "expiry"
            | otherwise = "state"
-  db <- DB.existingDB txn name
-  DB.get txn db (TE.encodeUtf8 key) >>= traverse decoded
+  meta <- DB.existingDB txn "metadata"
+  format <- DB.get txn meta "format"
+  let old = maybe False (B.isPrefixOf "[") format
+  db <- F.existing old txn name
+  F.getValue txn db (TE.encodeUtf8 key) >>= traverse decoded
 validateKey :: Store -> Text -> IO ()
 validateKey store key = unless (not (T.null key) && B.length (TE.encodeUtf8 key) <= keyLimit store) $
  fail "Append4: empty or oversized LMDB key"
@@ -237,7 +244,7 @@ commitTransaction store submitted expected = DB.write (environment store) $ \txn
      explicit = isNothing expected
      ident = if explicit then transactionId submitted else "local:" <> T.pack (show (before+1))
      tx = submitted { transactionId = ident }
- duplicate <- if explicit then isJust <$> DB.get txn meta (TE.encodeUtf8 ("id/"<>ident)) else pure False
+ duplicate <- if explicit then isJust <$> F.getValue txn meta (TE.encodeUtf8 ("id/"<>ident)) else pure False
  matches <- and <$> forM (conditions tx) (\(key,value) -> (==value) <$> readValue store txn key)
  original <- M.traverseWithKey (\key _ -> readValue store txn key) (M.fromList [(keyOf op,()) | op <- mutations tx])
  let changed = foldl' applyChange original (mutations tx)
@@ -250,12 +257,12 @@ commitTransaction store submitted expected = DB.write (environment store) $ \txn
   when (before >= toInteger (maxBound :: Word64)) $ fail "Append4: version exhausted"
   let number = before+1
   forM_ (M.toList changed) $ \(key,value) -> when (M.lookup key original /= Just value) $
-   maybe (DB.delete txn (databaseFor store key) (TE.encodeUtf8 key))
-    (DB.put txn (databaseFor store key) (TE.encodeUtf8 key) . encoded) value
-  DB.put txn meta "version" (encoded number)
-  when explicit $ DB.put txn meta (TE.encodeUtf8 ("id/"<>ident)) (encoded number)
+   maybe (F.deleteValue txn (databaseFor store key) (TE.encodeUtf8 key))
+    (F.putValue txn (databaseFor store key) (TE.encodeUtf8 key) . encoded) value
+  F.putValue txn meta "version" (encoded number)
+  when explicit $ F.putValue txn meta (TE.encodeUtf8 ("id/"<>ident)) (encoded number)
   when (historyPolicy (options store) == KeepHistory) $
-   DB.put txn (auditDB (databases store)) (versionKey number) (encoded (Append number [tx]))
+   F.putValue txn (auditDB (databases store)) (versionKey number) (encoded (Append number [tx]))
   pure (Accepted number)
 
 current :: Store -> IO (Maybe (DB.Txn,IORef Stage))
@@ -341,7 +348,7 @@ scanValues store txn lower upper prefix limit = do
       Just p | "receipts/" `T.isPrefixOf` p -> [receiptsDB dbs]
       Just p | "expiry/" `T.isPrefixOf` p -> [expiryDB dbs]
       _ -> [stateDB dbs,receiptsDB dbs,expiryDB dbs]
- raw <- concat <$> mapM (\db -> DB.scan txn db (TE.encodeUtf8 lower) (TE.encodeUtf8 <$> upper) (TE.encodeUtf8 <$> prefix) limit) selected
+ raw <- concat <$> mapM (\db -> F.scan txn db (TE.encodeUtf8 lower) (TE.encodeUtf8 <$> upper) (TE.encodeUtf8 <$> prefix) limit) selected
  rows <- forM raw $ \(key,value) -> do
   name <- either throwIO pure (TE.decodeUtf8' key)
   parsed <- decoded value
@@ -354,7 +361,7 @@ readSnapshot store = withReader store $ \txn -> Snapshot <$> readVersion store t
 historyPage :: Store -> Integer -> Int -> IO [Append]
 historyPage store after limit = withReader store $ \txn ->
  if historyPolicy (options store) == CurrentOnly || after >= toInteger (maxBound :: Word64) then pure [] else do
-  rows <- DB.scan txn (auditDB (databases store)) (versionKey (max 0 after+1)) Nothing Nothing limit
+  rows <- F.scan txn (auditDB (databases store)) (versionKey (max 0 after+1)) Nothing Nothing limit
   mapM (decoded . snd) rows
 history :: Store -> IO [Append]
 history store = historyPage store 0 maxBound
@@ -368,9 +375,55 @@ snapshotAt store number = withReader store $ \txn -> do
  else do
   -- Read history in bounded pages; only the requested snapshot stays resident.
   let replay after kv = do
-       rows <- DB.scan txn (auditDB (databases store)) (versionKey (after+1)) (Just (versionKey (number+1))) Nothing 128
+       rows <- F.scan txn (auditDB (databases store)) (versionKey (after+1)) (Just (versionKey (number+1))) Nothing 128
        items <- mapM (decoded . snd) rows
        case items of
         [] -> pure kv
         _ -> replay (appendId (last items)) (foldl' (\state item -> foldl' (\s tx -> apply s (mutations tx)) state (transactions item)) kv items)
   Just . Snapshot number <$> replay 0 M.empty
+
+-- Explicit migration primitives. The caller owns the app migration lock and
+-- excludes all writers. They never replace the source or silently convert open.
+isLegacyStorage :: FilePath -> IO Bool
+isLegacyStorage path = bracket (DB.openOffline path) DB.close $ \env ->
+ bracket (DB.begin env True) DB.abort $ \tx -> do
+  db <- DB.existingDB tx "metadata"
+  value <- DB.get tx db "format"
+  pure (maybe False (B.isPrefixOf "[") value)
+
+convertLegacyStorage :: Options -> FilePath -> FilePath -> IO ()
+convertLegacyStorage config source destination = do
+ exists <- doesFileExist destination
+ when exists (fail "Typed migration destination already exists")
+ bytes <- getFileSize source
+ -- Virtual address space only; pages are allocated as written. This conversion
+ -- is one transaction, so allocation failure leaves the old source authoritative.
+ let capacity=min (maximumMapBytes config) (max (initialMapBytes config) (bytes*64))
+ bracket (DB.openOffline source) DB.close $ \old ->
+  bracket (DB.begin old True) DB.abort $ \input ->
+   bracket (DB.open destination capacity) DB.close $ \new -> runInBoundThread $ do
+    DB.write new $ \output -> forM_ ["state","receipts","expiry","audit","metadata"] $ \name -> do
+     from <- DB.existingDB input name
+     to <- F.open False output name
+     rows <- DB.scan input from "" Nothing Nothing maxBound
+     forM_ rows $ \(key,bytesValue) -> do
+      value <- F.legacyDecode bytesValue
+      let converted=if name=="metadata" && key=="format"
+            then toJSON ("append4-flat-2" :: Text,show (historyPolicy config)) else value
+      F.putValue output to key converted
+    DB.sync new
+    -- Verify every record and namespace, including historic conditions,
+    -- transaction IDs, duplicate ledgers and revision counters.
+    bracket (DB.begin new True) DB.abort $ \output ->
+     forM_ ["state","receipts","expiry","audit","metadata"] $ \name -> do
+      from <- DB.existingDB input name
+      to <- F.existing False output name
+      rows <- DB.scan input from "" Nothing Nothing maxBound
+      actualKeys <- DB.scan output (F.roots to) "" Nothing Nothing maxBound
+      unless (map fst rows==map fst actualKeys) (fail "Typed migration key verification failed")
+      forM_ rows $ \(key,bytesValue) -> do
+       value <- F.legacyDecode bytesValue
+       let expected=if name=="metadata" && key=="format"
+             then toJSON ("append4-flat-2" :: Text,show (historyPolicy config)) else value
+       actual <- F.getValue output to key
+       unless (actual==Just expected) (fail "Typed migration value/history verification failed")

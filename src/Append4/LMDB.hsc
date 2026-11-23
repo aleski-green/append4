@@ -54,7 +54,7 @@ open path bytes = mask_ $ do
  env <- alloca $ \out -> envCreate out >>= check >> peek out
  flip onException (close env) $ do
   setMapSize env bytes
-  setMaxDBs env 8 >>= check
+  setMaxDBs env 32 >>= check
   setMaxReaders env 512 >>= check
   B.useAsCString (TE.encodeUtf8 (T.pack path)) $ \name ->
    envOpen env name (#{const MDB_NOSUBDIR} + #{const MDB_NOTLS}) 0o600 >>= check
@@ -71,7 +71,7 @@ openOffline :: FilePath -> IO Env
 openOffline path = mask_ $ do
  env <- alloca $ \out -> envCreate out >>= check >> peek out
  flip onException (close env) $ do
-  setMaxDBs env 8 >>= check
+  setMaxDBs env 32 >>= check
   B.useAsCString (TE.encodeUtf8 (T.pack path)) $ \name ->
    envOpen env name (#{const MDB_NOSUBDIR} + #{const MDB_NOTLS} + #{const MDB_RDONLY} + #{const MDB_NOLOCK}) 0 >>= check
   pure env
