@@ -1,0 +1,23 @@
+cabal-version: 3.6
+name: append4
+version: 0.1.0.0
+build-type: Simple
+license: LicenseRef-Sustainable-Use-1.0
+license-file: LICENSE.md
+library
+  exposed-modules: Append4
+  hs-source-dirs: src
+  default-language: Haskell2010
+  default-extensions: OverloadedStrings, ScopedTypeVariables, DeriveGeneric
+  ghc-options: -Wall -Werror=incomplete-patterns
+  build-depends: base >=4.18 && <5, aeson, bytestring, containers, text, stm, async, binary, directory, filepath, filelock, cryptohash-sha256
+  if !os(windows)
+    build-depends: unix
+
+executable append4-fixture
+  main-is: Fixture.hs
+  hs-source-dirs: spec
+  default-language: Haskell2010
+  default-extensions: OverloadedStrings, ScopedTypeVariables
+  ghc-options: -threaded -Wall
+  build-depends: base, append4, aeson, bytestring, containers, text, directory, filepath, async, stm
