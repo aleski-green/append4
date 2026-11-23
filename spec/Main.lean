@@ -11,7 +11,7 @@ def main (args : List String) : IO UInt32 := do
     let facts ← IO.ofExcept <| Json.parse observed.stdout
     for name in ["emptyFlush","publication","noChange","noCrossTransactionNetting",
       "snapshotIsolation","historicalRead","atomicConflict","orderedValidation","duplicate","concurrentValidation","rollback",
-      "afterCommit","closeDrains","recovery","incompleteTail","corruption","syncFailure","exclusiveWriter"] do
+      "afterCommit","cancelledWaiter","closeDrains","recovery","incompleteTail","corruption","syncFailure","exclusiveWriter"] do
       unless (← IO.ofExcept <| facts.getObjValAs? Bool name) do throw <| IO.userError s!"FAIL {name}"
       IO.println s!"PASS {name}"
   IO.FS.withTempDir fun root => do

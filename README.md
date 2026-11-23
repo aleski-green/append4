@@ -15,6 +15,8 @@ back on an exception, checks the original snapshot before commit, and waits for
 the host's next flush. Call `flush` from a separate host worker. `afterCommit`
 callbacks run only after successful completion; callbacks are not durable jobs.
 The host must persist action intents/state before dispatching external effects.
+Cancellation after enqueue drains that transaction before releasing the author
+and runs accepted post-commit callbacks before rethrowing cancellation.
 
 `readSnapshot` returns an immutable map. `snapshotAt` returns the final state of
 an append; `history` preserves transaction and mutation order. `closeStore`

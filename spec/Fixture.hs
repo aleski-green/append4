@@ -10,6 +10,7 @@ import qualified Data.ByteString as B
 import qualified Data.ByteString.Lazy.Char8 as L
 import qualified Data.Map.Strict as M
 import Data.Maybe
+import GHC.Conc (threadStatus, ThreadStatus(..), BlockReason(..))
 import System.Directory
 import System.Environment
 import System.FilePath
@@ -61,9 +62,9 @@ checks path = do
  pinned <- A.readSnapshot store
  same <- put "same" "assistant"
  missing <- A.submit store (tx "missing" [A.Delete "absent"])
- cancel <- A.submit store (tx "cancel" [A.Set "role" (String "manager"),A.Set "role" (String "assistant")])
+ roundTrip <- A.submit store (tx "cancel" [A.Set "role" (String "manager"),A.Set "role" (String "assistant")])
  A.flush store
- rejectedResults <- mapM A.await [same,missing,cancel]
+ rejectedResults <- mapM A.await [same,missing,roundTrip]
  afterRejected <- A.readSnapshot store
  opposing1 <- put "two" "manager"
  opposing2 <- put "three" "assistant"
@@ -116,6 +117,24 @@ checks path = do
  finish
  wait finished
  effectsAfter <- not <$> isEmptyMVar effect
+ -- Cancel precisely at the queued acknowledgement wait: it must settle the
+ -- predecessor and run its callbacks before another author reads the state.
+ ready <- newEmptyMVar
+ dispatched <- newEmptyMVar
+ cancelled <- async $ A.transaction store $ do
+  A.putValue store "cancelled-waiter" (Bool True)
+  A.afterCommit store (putMVar dispatched ())
+  putMVar ready ()
+ takeMVar ready
+ let queuedWait = threadStatus (asyncThreadId cancelled) >>= \status ->
+      case status of ThreadBlocked BlockedOnSTM -> pure (); _ -> yield >> queuedWait
+ queuedWait
+ cancel cancelled
+ settled <- A.getValue store "cancelled-waiter"
+ dispatchedOnce <- not <$> isEmptyMVar dispatched
+ next <- async (A.transaction store (A.putValue store "after-cancellation" (Bool True)))
+ settle next
+ wait next
  queued <- put "close" "closed"
  A.closeStore store
  closedResult <- A.await queued
@@ -153,6 +172,7 @@ checks path = do
   , "concurrentValidation" .= (conflictRaised && winner==Just (String "winner"))
   , "rollback" .= (failed && isNothing rollback && effectRolledBack)
   , "afterCommit" .= effectsAfter
+  , "cancelledWaiter" .= (settled==Just (Bool True) && dispatchedOnce)
   , "closeDrains" .= (closedResult==A.Accepted (A.version recovered) && M.lookup "role" (A.entries recovered)==Just (String "closed") && closedReject)
   , "recovery" .= (M.lookup "first" (A.entries recovered)==Just (Bool True) && M.lookup "second" (A.entries recovered)==Just (Bool True))
   , "incompleteTail" .= (tailRecovered==recovered)

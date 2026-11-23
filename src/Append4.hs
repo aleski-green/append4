@@ -65,7 +65,7 @@ apply = foldl step where
  step kv (Delete key) = M.delete key kv
 
 -- Complete records are checked against their predecessor. Only an incomplete
--- final frame is discarded. A complete frame with a bad checksum always fails open.
+-- final frame is discarded. A complete frame with a bad checksum rejects the journal.
 recover :: Handle -> IO State
 recover h = go 0 (State (Snapshot 0 M.empty) Q.empty (B.replicate 32 0)) where
  go offset state@(State snap past previous) = do
@@ -221,8 +221,8 @@ transaction store action = do
  nested <- current store
  case nested of
   Just _ -> action
-  Nothing -> do
-   (result,effects) <- withMVar (author store) $ \_ -> mask $ \restore -> do
+  Nothing -> mask $ \restore -> do
+   (result,effects,interrupted) <- withMVar (author store) $ \_ -> do
     atomically (ensureOpen store)
     snap <- readSnapshot store
     thread <- myThreadId
@@ -231,17 +231,28 @@ transaction store action = do
     let reset = writeIORef (local store) Nothing
     (do result <- restore action
         (_,ops,effects) <- readIORef ref
-        unless (null ops) $ do
+        interrupted <- if null ops then pure Nothing else do
          serial <- atomicModifyIORef' (nonce store) (\n -> (n+1,n+1))
          ticket <- enqueue store (Transaction (T.pack (show (version snap) ++ ":" ++ show serial)) [] (reverse ops)) (Just (entries snap))
-         outcome <- await ticket
+         completion <- try (await ticket)
+         (outcome,interrupted) <- case completion of
+          Right value -> pure (value,Nothing)
+          Left err | Just (_::SomeAsyncException) <- fromException err -> do
+           -- Resolve an enqueued transaction before releasing its author. Otherwise
+           -- a cancelled waiter can leave a later transaction based on stale state.
+           flush store
+           value <- await ticket
+           pure (value,Just err)
+          Left err -> throwIO (err::SomeException)
          case outcome of
           Accepted _ -> pure ()
           NoChange -> pure ()
           _ -> fail ("Append4: transaction rejected: "++show outcome)
+         pure interrupted
         reset
-        pure (result,reverse effects)) `onException` reset
+        pure (result,reverse effects,interrupted)) `onException` reset
    sequence_ effects
+   mapM_ throwIO interrupted
    pure result
 getValue :: Store -> Text -> IO (Maybe Value)
 getValue store key = M.lookup key . entries <$> view store
